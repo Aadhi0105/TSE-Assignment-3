@@ -25,6 +25,8 @@ knitr::opts_chunk$set(
   fig.height = 4
 )
 ```
+
+
 ```{r packages}
 required_pkgs <- c(
   "readxl", "tseries", "tidyverse", "tsibble",
@@ -44,3 +46,504 @@ library(feasts)
 library(urca)
 library(forecast)
 ```
+
+```{r data-loading}
+# Load the Singapore visitor arrivals data
+visitors_raw <- read_excel("SingaporeVisitors.xlsx")
+
+# Inspect the raw structure
+head(visitors_raw)
+str(visitors_raw)
+```
+
+```{r data-preparation}
+# Rename columns for convenience
+visitors <- visitors_raw %>%
+  rename(
+    date     = `Month Year`,
+    arrivals = `Visitor Arrivals`
+  ) %>%
+  mutate(date = as.Date(date))
+
+# Restrict to training period: January 2008 to December 2018
+train <- visitors %>%
+  filter(date >= as.Date("2008-01-01") & date <= as.Date("2018-12-01"))
+
+# Test period: January 2019 to December 2019
+test <- visitors %>%
+  filter(date >= as.Date("2019-01-01") & date <= as.Date("2019-12-01"))
+
+# Verify dimensions
+cat("Training rows:", nrow(train), "\n")  # expect 132
+cat("Test rows:    ", nrow(test),  "\n")  # expect 12
+
+# Convert training data to ts object (frequency = 12 for monthly)
+train_ts <- ts(train$arrivals, start = c(2008, 1), frequency = 12)
+
+# Quick plot of raw training series
+autoplot(train_ts) +
+  labs(title = "Singapore Visitor Arrivals (Jan 2008 – Dec 2018)",
+       x = "Year", y = "Arrivals") +
+  theme_minimal()
+```
+
+The raw training series (January 2008 – December 2018) exhibits two prominent 
+features. First, there is a clear **upward trend** — visitor arrivals grow from 
+roughly 800,000 per month in 2008 to over 1,500,000 by 2018. Second, regular 
+**seasonal fluctuations** are visible throughout, with recurring peaks and troughs 
+within each year, consistent with the monthly seasonality ($m = 12$) expected in 
+tourism data. 
+
+Both features confirm that the series is non-stationary in its raw 
+form, and that differencing will be required before ARMA modelling can proceed.
+
+## Problem 1: Model Selection and Forecasting
+
+### Part (a): Seasonal Differencing
+
+Since the series exhibits a seasonal pattern with period $m = 12$, we apply a 
+seasonal difference of lag 12, i.e. $\nabla_{12} y_t = y_t - y_{t-12}$, to 
+remove the seasonal component. We then plot the differenced series and examine 
+its ACF to assess whether stationarity has been achieved.
+
+```{r seasonal-differencing}
+# Apply seasonal differencing (lag 12)
+train_ts_sdiff <- diff(train_ts, lag = 12)
+
+# Plot the seasonally differenced series
+autoplot(train_ts_sdiff) +
+  labs(title = "Seasonally Differenced Visitor Arrivals (Lag 12)",
+       x = "Year", y = expression(nabla[12] ~ y[t])) +
+  theme_minimal()
+
+# ACF of the seasonally differenced series
+ggAcf(train_ts_sdiff, lag.max = 48) +
+  labs(title = "ACF of Seasonally Differenced Series") +
+  theme_minimal()
+```
+
+The seasonally differenced series $\nabla_{12} y_t = y_t - y_{t-12}$ oscillates 
+around zero with no visible upward or downward trend, suggesting that the seasonal 
+differencing has successfully removed the deterministic seasonal component. However, 
+the series does not appear to fluctuate around a constant mean throughout the sample 
+— there is a notable downward drift between 2013 and 2015 followed by a recovery — 
+which raises some concern about full stationarity.
+
+The ACF provides further evidence against stationarity: the autocorrelations decay 
+very slowly and remain significant for many lags (up to lag 10–11), which is 
+characteristic of a unit root process. Additionally, significant spikes reappear 
+around lags 36 and 48, suggesting residual long-run dependence. Overall, the 
+seasonally differenced series does **not** appear fully stationary, and a further 
+non-seasonal difference is likely required.
+
+### Part (b): ADF Test and Non-Seasonal Differencing
+
+To formally assess whether a non-seasonal difference is needed, we apply an 
+Augmented Dickey-Fuller (ADF) test to the seasonally differenced series. The null 
+hypothesis is that the series contains a unit root (non-stationary); rejection 
+of the null indicates stationarity suitable for ARMA modelling.
+
+
+```{r adf-test}
+# ADF test on the seasonally differenced series
+adf_result <- adf.test(train_ts_sdiff)
+print(adf_result)
+
+# The ADF test p-value guides our decision:
+# p > 0.05 -> fail to reject unit root -> apply non-seasonal differencing
+# p < 0.05 -> reject unit root -> series is stationary
+
+# Apply non-seasonal differencing since ACF suggested non-stationarity
+train_ts_diff <- diff(train_ts_sdiff, lag = 1)
+
+# Plot the doubly differenced series
+autoplot(train_ts_diff) +
+  labs(title = "Doubly Differenced Visitor Arrivals (Seasonal + Non-Seasonal)",
+       x = "Year", y = expression(nabla ~ nabla[12] ~ y[t])) +
+  theme_minimal()
+
+# Confirm stationarity with ADF test on doubly differenced series
+adf_result2 <- adf.test(train_ts_diff)
+print(adf_result2)
+```
+
+The ADF test on the seasonally differenced series yields a Dickey-Fuller statistic 
+of $-3.055$ with a p-value of $0.139$, which is well above the 5% significance 
+level. We therefore **fail to reject** the null hypothesis of a unit root, 
+confirming that the seasonally differenced series is not yet stationary and that 
+a further non-seasonal difference is required.
+
+After applying an additional non-seasonal difference, the doubly differenced series 
+$\nabla \nabla_{12} y_t$ fluctuates around zero with no visible trend or drift, 
+and the ADF test yields a Dickey-Fuller statistic of $-5.431$ with a p-value of 
+$0.01$ (the minimum reportable by the test). We **reject** the null hypothesis of 
+a unit root at all conventional significance levels. The doubly differenced series 
+is therefore stationary and suitable for ARMA modelling. This corresponds to a 
+SARIMA specification with $d = 1$ and $D = 1$.
+
+
+### Part (c): Box-Jenkins Approach — ACF and PACF Inspection
+
+With the doubly differenced series $\nabla \nabla_{12} y_t$ confirmed as 
+stationary, we follow the Box-Jenkins approach and inspect its ACF and PACF 
+to identify candidate ARMA$(p, q)$ orders. We also examine whether any residual 
+seasonality remains at the seasonal lags (multiples of 12).
+
+```{r acf-pacf}
+# ACF of the doubly differenced series
+p1 <- ggAcf(train_ts_diff, lag.max = 48) +
+  labs(title = "ACF of Doubly Differenced Series") +
+  theme_minimal()
+
+# PACF of the doubly differenced series
+p2 <- ggPacf(train_ts_diff, lag.max = 48) +
+  labs(title = "PACF of Doubly Differenced Series") +
+  theme_minimal()
+
+# Display side by side
+library(gridExtra)
+grid.arrange(p1, p2, ncol = 2)
+```
+
+The ACF and PACF of the doubly differenced series $\nabla \nabla_{12} y_t$ reveal 
+the following patterns:
+
+**Non-seasonal lags (lags 1–11):** The ACF shows a significant spike at lag 1 and 
+a few marginally significant spikes at lags 2–3, before cutting off. The PACF also 
+shows a significant spike at lag 1 and then dies off gradually. This pattern is 
+broadly consistent with a low-order MA(1) or ARMA(1,1) process for the non-seasonal 
+component.
+
+**Seasonal lags (multiples of 12):** The ACF shows significant spikes at lags 12, 
+24, and 36, suggesting residual seasonal autocorrelation that was not fully removed 
+by the seasonal difference alone. The PACF similarly shows significant spikes at 
+seasonal lags. This indicates that seasonal AR or MA terms may be needed in the 
+final SARIMA specification.
+
+Based on this inspection, candidate non-seasonal orders are $p, q \in \{0, 1, 2, 3\}$, 
+which will be compared formally using information criteria in Part (d).
+
+
+### Part (d): ARMA Model Selection via AIC and BIC
+
+We now systematically compare all ARMA$(p, q)$ models for $0 \leq p, q \leq 3$ 
+fitted to the doubly differenced series, using AIC and BIC as selection criteria. 
+The preferred model(s) are then estimated and subjected to residual diagnostics 
+to verify adequacy.
+
+```{r model-selection}
+# Grid search over ARMA(p,q) for 0 <= p,q <= 3
+# Fitted to the doubly differenced series
+
+p_orders <- 0:3
+q_orders <- 0:3
+
+results <- data.frame(
+  p     = integer(),
+  q     = integer(),
+  AIC   = numeric(),
+  BIC   = numeric()
+)
+
+for (p in p_orders) {
+  for (q in q_orders) {
+    tryCatch({
+      fit <- Arima(train_ts_diff, order = c(p, 0, q))
+      results <- rbind(results, data.frame(
+        p   = p,
+        q   = q,
+        AIC = AIC(fit),
+        BIC = BIC(fit)
+      ))
+    }, error = function(e) NULL)
+  }
+}
+
+# Sort by AIC and BIC
+results_aic <- results[order(results$AIC), ]
+results_bic <- results[order(results$BIC), ]
+
+cat("--- Top 5 models by AIC ---\n")
+print(head(results_aic, 5))
+
+cat("\n--- Top 5 models by BIC ---\n")
+print(head(results_bic, 5))
+
+# Highlight best models
+cat("\nBest model by AIC: ARMA(", results_aic$p[1], ",", results_aic$q[1], ")\n")
+cat("Best model by BIC: ARMA(", results_bic$p[1], ",", results_bic$q[1], ")\n")
+```
+
+The grid search over all ARMA$(p,q)$ models with $0 \leq p, q \leq 3$ yields the 
+following conclusions:
+
+**AIC criterion:** The preferred model is ARMA$(2, 1)$ with AIC $= 2915.77$, 
+followed closely by ARMA$(1, 2)$ (AIC $= 2916.20$) and ARMA$(3, 2)$ 
+(AIC $= 2917.10$). The differences among the top models are small, suggesting 
+that several specifications fit the data similarly well.
+
+**BIC criterion:** The preferred model is ARMA$(0, 1)$ with BIC $= 2926.93$, 
+followed by ARMA$(1, 0)$ (BIC $= 2928.36$). BIC applies a heavier penalty for 
+additional parameters than AIC, and therefore favours the more parsimonious 
+specifications.
+
+We proceed with two candidate models: **ARMA$(2,1)$** as selected by AIC, and 
+**ARMA$(0,1)$** as selected by BIC. Both will be estimated on the doubly 
+differenced series and subjected to residual diagnostics. In the SARIMA 
+framework, these correspond to ARIMA$(2,1,1)(0,1,0)_{12}$ and 
+ARIMA$(0,1,1)(0,1,0)_{12}$ respectively.
+
+#### Estimation and Residual Diagnostics
+
+We now estimate both selected models and perform residual diagnostics to verify 
+that the residuals behave as white noise — a necessary condition for the model 
+to be adequate. We inspect the residual ACF and apply the Ljung-Box test for 
+remaining serial correlation.
+
+```{r residual-diagnostics}
+# Estimate the two selected models on the ORIGINAL training series
+# (d=1, D=1 absorbed into the ARIMA specification)
+
+# AIC-preferred: ARIMA(2,1,1)(0,1,0)[12]
+fit_aic <- Arima(train_ts, order = c(2, 1, 1),
+                 seasonal = list(order = c(0, 1, 0), period = 12))
+
+# BIC-preferred: ARIMA(0,1,1)(0,1,0)[12]
+fit_bic <- Arima(train_ts, order = c(0, 1, 1),
+                 seasonal = list(order = c(0, 1, 0), period = 12))
+
+# Print summaries
+cat("=== AIC-preferred: ARIMA(2,1,1)(0,1,0)[12] ===\n")
+print(summary(fit_aic))
+
+cat("\n=== BIC-preferred: ARIMA(0,1,1)(0,1,0)[12] ===\n")
+print(summary(fit_bic))
+
+# Residual diagnostics for AIC model
+cat("\n--- Ljung-Box Test: ARIMA(2,1,1)(0,1,0)[12] ---\n")
+print(Box.test(residuals(fit_aic), lag = 24, type = "Ljung-Box", fitdf = 3))
+
+# Residual diagnostics for BIC model
+cat("\n--- Ljung-Box Test: ARIMA(0,1,1)(0,1,0)[12] ---\n")
+print(Box.test(residuals(fit_bic), lag = 24, type = "Ljung-Box", fitdf = 1))
+
+# Residual plots
+p1 <- ggAcf(residuals(fit_aic), lag.max = 48) +
+  labs(title = "ACF of Residuals: ARIMA(2,1,1)(0,1,0)[12]") +
+  theme_minimal()
+
+p2 <- ggAcf(residuals(fit_bic), lag.max = 48) +
+  labs(title = "ACF of Residuals: ARIMA(0,1,1)(0,1,0)[12]") +
+  theme_minimal()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+**Model Estimates:**
+
+The AIC-preferred ARIMA$(2,1,1)(0,1,0)_{12}$ yields coefficients 
+$\hat{\phi}_1 = -1.229$, $\hat{\phi}_2 = -0.351$, $\hat{\theta}_1 = 1.000$, 
+with $\hat{\sigma}^2 = 2.367 \times 10^9$ and a training MAPE of $2.97\%$. 
+The BIC-preferred ARIMA$(0,1,1)(0,1,0)_{12}$ is considerably more parsimonious, 
+with a single coefficient $\hat{\theta}_1 = -0.329$, $\hat{\sigma}^2 = 2.518 \times 10^9$, 
+and a training MAPE of $3.04\%$.
+
+**Residual Diagnostics:**
+
+Both models fail the Ljung-Box test at the 5\% significance level: the 
+ARIMA$(2,1,1)(0,1,0)_{12}$ yields $Q(24) = 34.35$ (p-value $= 0.033$) and the 
+ARIMA$(0,1,1)(0,1,0)_{12}$ yields $Q(24) = 38.79$ (p-value $= 0.021$). The 
+residual ACF plots confirm significant spikes at seasonal lags (particularly 
+lags 12 and 24), indicating that neither model fully captures the seasonal 
+dynamics of the series. This strongly motivates the inclusion of explicit 
+seasonal AR and MA terms.
+
+### Part (e): Automatic SARIMA Selection
+
+Since the models in Part (d) lack explicit seasonal AR and MA components and 
+exhibit residual seasonal autocorrelation, we now use an automatic procedure 
+via the \texttt{fable} package to search over SARIMA specifications with 
+seasonal orders $0 \leq P, Q \leq 2$ and $D = 1$, alongside non-seasonal 
+orders $0 \leq p, q \leq 3$ and $d = 1$. The automatically selected model 
+is then compared against the Part (d) candidates.
+
+```{r sarima-auto}
+# Convert training data to tsibble format for fable
+train_tsibble <- train %>%
+  mutate(date = yearmonth(date)) %>%
+  as_tsibble(index = date)
+
+# Automatic SARIMA search over specified orders
+fit_auto <- train_tsibble %>%
+  model(
+    ARIMA = ARIMA(arrivals ~ pdq(0:3, 1, 0:3) + PDQ(0:2, 1, 0:2))
+  )
+
+# Report the selected model
+cat("=== Automatically Selected SARIMA Model ===\n")
+report(fit_auto)
+
+# Compare with Part (d) models — refit in fable for consistency
+fit_compare <- train_tsibble %>%
+  model(
+    AIC_model  = ARIMA(arrivals ~ pdq(2, 1, 1) + PDQ(0, 1, 0)),
+    BIC_model  = ARIMA(arrivals ~ pdq(0, 1, 1) + PDQ(0, 1, 0)),
+    Auto_SARIMA = ARIMA(arrivals ~ pdq(0:3, 1, 0:3) + PDQ(0:2, 1, 0:2))
+  )
+
+# Print AIC and BIC for all three
+cat("\n=== Model Comparison: AIC and BIC ===\n")
+glance(fit_compare) %>%
+  select(.model, AIC, BIC) %>%
+  arrange(AIC) %>%
+  print()
+```
+
+The automatic procedure selects **ARIMA$(1,1,2)(1,1,1)_{12}$** as the optimal 
+SARIMA model, with coefficients $\hat{\phi}_1 = -0.850$, $\hat{\theta}_1 = 0.570$, 
+$\hat{\theta}_2 = -0.396$, $\hat{\Phi}_1 = 0.445$, and $\hat{\Theta}_1 = -0.752$, 
+with $\hat{\sigma}^2 = 2.183 \times 10^9$.
+
+The three-way model comparison reveals a clear ranking:
+
+| Model | AIC | BIC |
+|-------|-----|-----|
+| ARIMA$(1,1,2)(1,1,1)_{12}$ | **2908.04** | 2924.72 |
+| ARIMA$(2,1,1)(0,1,0)_{12}$ | 2913.91 | 2925.03 |
+| ARIMA$(0,1,1)(0,1,0)_{12}$ | 2916.76 | **2922.31** |
+
+The automatically selected SARIMA model achieves the lowest AIC by a margin of 
+nearly 6 points over the AIC-preferred Part (d) model, confirming that the 
+inclusion of seasonal AR and MA terms $(\Phi_1, \Theta_1)$ substantially improves 
+fit. The BIC-preferred model remains ARIMA$(0,1,1)(0,1,0)_{12}$ due to its extreme 
+parsimony, but the automatic SARIMA is competitive on BIC as well. 
+
+### Part (f): Forecasting and Forecast Evaluation
+
+We now generate 12-step ahead forecasts for the test period January 2019 to 
+December 2019 using all three model specifications. Forecast accuracy is evaluated 
+using three metrics: Root Mean Squared Error (RMSE), Mean Absolute Error (MAE), 
+and Mean Absolute Percentage Error (MAPE).
+
+```{r forecasting}
+# Convert test data to tsibble format
+test_tsibble <- test %>%
+  mutate(date = yearmonth(date)) %>%
+  as_tsibble(index = date)
+
+# Generate 12-step ahead forecasts for all three models
+forecasts <- fit_compare %>%
+  forecast(h = 12)
+
+# Plot forecasts against actual test data
+forecasts %>%
+  autoplot(train_tsibble, level = 95) +
+  autolayer(test_tsibble, arrivals, colour = "black", linewidth = 0.8) +
+  labs(title = "12-Month Ahead Forecasts vs Actual (Jan–Dec 2019)",
+       x = "Month", y = "Visitor Arrivals") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Compute accuracy metrics against test set
+accuracy_metrics <- forecasts %>%
+  accuracy(test_tsibble)
+
+# Display RMSE, MAE, MAPE for each model
+cat("=== Forecast Accuracy: Jan–Dec 2019 ===\n")
+accuracy_metrics %>%
+  select(.model, RMSE, MAE, MAPE) %>%
+  arrange(RMSE) %>%
+  print()
+```
+The forecast plot shows that all three models track the general level and seasonal 
+pattern of the test period well, with the 95\% prediction intervals comfortably 
+containing the actual observations throughout January–December 2019.
+
+The accuracy metrics confirm a clear ranking:
+
+| Model | RMSE | MAE | MAPE |
+|-------|------|-----|------|
+| ARIMA$(1,1,2)(1,1,1)_{12}$ | **40,397** | **34,066** | **2.12\%** |
+| ARIMA$(0,1,1)(0,1,0)_{12}$ | 45,695 | 37,710 | 2.35\% |
+| ARIMA$(2,1,1)(0,1,0)_{12}$ | 45,950 | 37,388 | 2.33\% |
+
+The automatically selected SARIMA$(1,1,2)(1,1,1)_{12}$ outperforms both Part (d) 
+models on all three metrics by a substantial margin. Its MAPE of $2.12\%$ indicates 
+that forecasts deviate from actual arrivals by just over 2\% on average — a strong 
+result for a 12-month horizon. The inclusion of seasonal AR and MA components 
+$(\Phi_1, \Theta_1)$ is clearly beneficial, capturing the seasonal dynamics that 
+the simpler Part (d) specifications miss. The two Part (d) models perform similarly 
+to each other, with the AIC model marginally better on MAE and the BIC model 
+marginally better on RMSE.
+
+## Problem 2: Dickey-Fuller Testing via Monte Carlo Simulation
+
+In this problem we investigate the finite-sample distribution of the 
+Augmented Dickey-Fuller (ADF) t-statistic through Monte Carlo simulation. 
+The ADF test is programmed from scratch — no existing R functions for the 
+ADF test are used. We simulate data from the AR(2) process
+$$y_t = \alpha_1 y_{t-1} + \alpha_2 y_{t-2} + \varepsilon_t, \quad 
+\varepsilon_t \sim \text{iid}\, \mathcal{N}(0, \sigma^2),$$
+with $\alpha_1 = 0.7$, $\alpha_2 = 0.3$, $\sigma = 0.9$, and initial 
+conditions $y_{-1} = y_0 = 0$.
+
+### Part (a)–(d): Monte Carlo Setup
+
+We repeat the simulation for $T \in \{25, 100, 500, 5000\}$ with $M = 1000$ 
+replications each. For each simulated series we estimate three ADF regression 
+specifications and record the t-statistic on $\phi$:
+
+- **(i)** No constant, no trend: $\Delta y_t = \phi y_{t-1} + \alpha_1^* \Delta y_{t-1} + \varepsilon_t$
+- **(ii)** With constant: $\Delta y_t = c + \phi y_{t-1} + \alpha_1^* \Delta y_{t-1} + \varepsilon_t$  
+- **(iii)** With constant and trend: $\Delta y_t = c + \delta t + \phi y_{t-1} + \alpha_1^* \Delta y_{t-1} + \varepsilon_t$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
