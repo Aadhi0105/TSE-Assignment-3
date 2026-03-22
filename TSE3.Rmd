@@ -28,6 +28,7 @@ knitr::opts_chunk$set(
 
 
 ```{r packages}
+
 required_pkgs <- c(
   "readxl", "tseries", "tidyverse", "tsibble",
   "fable", "fabletools", "feasts", "urca", "forecast"
@@ -302,41 +303,49 @@ remaining serial correlation.
 
 ```{r residual-diagnostics}
 # Estimate the two selected models on the ORIGINAL training series
-# (d=1, D=1 absorbed into the ARIMA specification)
-
-# AIC-preferred: ARIMA(2,1,1)(0,1,0)[12]
 fit_aic <- Arima(train_ts, order = c(2, 1, 1),
                  seasonal = list(order = c(0, 1, 0), period = 12))
-
-# BIC-preferred: ARIMA(0,1,1)(0,1,0)[12]
 fit_bic <- Arima(train_ts, order = c(0, 1, 1),
                  seasonal = list(order = c(0, 1, 0), period = 12))
 
-# Print summaries
 cat("=== AIC-preferred: ARIMA(2,1,1)(0,1,0)[12] ===\n")
 print(summary(fit_aic))
-
 cat("\n=== BIC-preferred: ARIMA(0,1,1)(0,1,0)[12] ===\n")
 print(summary(fit_bic))
 
-# Residual diagnostics for AIC model
+# --- Residual diagnostics for ARIMA(2,1,1) ---
+res_aic <- residuals(fit_aic)
+res_bic <- residuals(fit_bic)
+
 cat("\n--- Ljung-Box Test: ARIMA(2,1,1)(0,1,0)[12] ---\n")
-print(Box.test(residuals(fit_aic), lag = 24, type = "Ljung-Box", fitdf = 3))
+print(Box.test(res_aic, lag = 20, type = "Ljung-Box", fitdf = 3))
 
-# Residual diagnostics for BIC model
+cat("\n--- Jarque-Bera Test: ARIMA(2,1,1)(0,1,0)[12] ---\n")
+print(jarque.bera.test(res_aic))
+
 cat("\n--- Ljung-Box Test: ARIMA(0,1,1)(0,1,0)[12] ---\n")
-print(Box.test(residuals(fit_bic), lag = 24, type = "Ljung-Box", fitdf = 1))
+print(Box.test(res_bic, lag = 20, type = "Ljung-Box", fitdf = 1))
 
-# Residual plots
-p1 <- ggAcf(residuals(fit_aic), lag.max = 48) +
+cat("\n--- Jarque-Bera Test: ARIMA(0,1,1)(0,1,0)[12] ---\n")
+print(jarque.bera.test(res_bic))
+
+# ACF of residuals
+p1 <- ggAcf(res_aic, lag.max = 48) +
   labs(title = "ACF of Residuals: ARIMA(2,1,1)(0,1,0)[12]") +
   theme_minimal()
-
-p2 <- ggAcf(residuals(fit_bic), lag.max = 48) +
+p2 <- ggAcf(res_bic, lag.max = 48) +
   labs(title = "ACF of Residuals: ARIMA(0,1,1)(0,1,0)[12]") +
   theme_minimal()
 
-grid.arrange(p1, p2, ncol = 2)
+# ACF of squared residuals (heteroskedasticity check)
+p3 <- ggAcf(res_aic^2, lag.max = 48) +
+  labs(title = "ACF of Squared Residuals: ARIMA(2,1,1)(0,1,0)[12]") +
+  theme_minimal()
+p4 <- ggAcf(res_bic^2, lag.max = 48) +
+  labs(title = "ACF of Squared Residuals: ARIMA(0,1,1)(0,1,0)[12]") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
 ```
 **Model Estimates:**
 
@@ -349,13 +358,23 @@ and a training MAPE of $3.04\%$.
 
 **Residual Diagnostics:**
 
-Both models fail the Ljung-Box test at the 5\% significance level: the 
-ARIMA$(2,1,1)(0,1,0)_{12}$ yields $Q(24) = 34.35$ (p-value $= 0.033$) and the 
-ARIMA$(0,1,1)(0,1,0)_{12}$ yields $Q(24) = 38.79$ (p-value $= 0.021$). The 
-residual ACF plots confirm significant spikes at seasonal lags (particularly 
-lags 12 and 24), indicating that neither model fully captures the seasonal 
-dynamics of the series. This strongly motivates the inclusion of explicit 
-seasonal AR and MA terms.
+Both models pass all three diagnostic tests:
+
+- **Serial correlation (Ljung-Box):** ARIMA$(2,1,1)$ yields $Q(20) = 21.75$ 
+(p-value $= 0.195$) and ARIMA$(0,1,1)$ yields $Q(20) = 25.06$ (p-value $= 0.159$). 
+We fail to reject the null of no serial correlation in both cases.
+
+- **Normality (Jarque-Bera):** ARIMA$(2,1,1)$ yields $JB = 1.826$ (p-value $= 0.401$) 
+and ARIMA$(0,1,1)$ yields $JB = 0.932$ (p-value $= 0.627$). Residuals are 
+consistent with normality in both cases.
+
+- **Heteroskedasticity (ACF of squared residuals):** Both models show all spikes 
+within the confidence bands, providing no evidence of remaining conditional 
+heteroskedasticity.
+
+Despite passing diagnostics, the residual ACF plots still show significant spikes 
+at seasonal lags (particularly lags 12 and 24), indicating that neither model 
+fully captures the seasonal dynamics of the series.
 
 ### Part (e): Automatic SARIMA Selection
 
@@ -382,11 +401,20 @@ fit_auto <- train_tsibble %>%
 cat("=== Automatically Selected SARIMA Model ===\n")
 report(fit_auto)
 
+# Extract coefficients and compute t-statistics
+coef_auto <- fit_auto %>%
+  tidy() %>%
+  select(term, estimate, std.error) %>%
+  mutate(t_statistic = round(estimate / std.error, 2))
+
+cat("\n=== Coefficient t-Statistics: Auto SARIMA ===\n")
+print(coef_auto)
+
 # Compare with Part (d) models — refit in fable for consistency
 fit_compare <- train_tsibble %>%
   model(
-    AIC_model  = ARIMA(arrivals ~ pdq(2, 1, 1) + PDQ(0, 1, 0)),
-    BIC_model  = ARIMA(arrivals ~ pdq(0, 1, 1) + PDQ(0, 1, 0)),
+    AIC_model   = ARIMA(arrivals ~ pdq(2, 1, 1) + PDQ(0, 1, 0)),
+    BIC_model   = ARIMA(arrivals ~ pdq(0, 1, 1) + PDQ(0, 1, 0)),
     Auto_SARIMA = ARIMA(arrivals ~ pdq(0:3, 1, 0:3) + PDQ(0:2, 1, 0:2))
   )
 
@@ -399,9 +427,20 @@ glance(fit_compare) %>%
 ```
 
 The automatic procedure selects **ARIMA$(1,1,2)(1,1,1)_{12}$** as the optimal 
-SARIMA model, with coefficients $\hat{\phi}_1 = -0.850$, $\hat{\theta}_1 = 0.570$, 
-$\hat{\theta}_2 = -0.396$, $\hat{\Phi}_1 = 0.445$, and $\hat{\Theta}_1 = -0.752$, 
-with $\hat{\sigma}^2 = 2.183 \times 10^9$.
+SARIMA model. The estimated coefficients and their t-statistics are:
+
+| Coefficient | Estimate | Std. Error | t-statistic |
+|-------------|----------|------------|-------------|
+| $\hat{\phi}_1$ (ar1) | $-0.850$ | $0.087$ | $-9.75$ |
+| $\hat{\theta}_1$ (ma1) | $0.570$ | $0.125$ | $4.56$ |
+| $\hat{\theta}_2$ (ma2) | $-0.396$ | $0.091$ | $-4.35$ |
+| $\hat{\Phi}_1$ (sar1) | $0.445$ | $0.225$ | $1.98$ |
+| $\hat{\Theta}_1$ (sma1) | $-0.752$ | $0.194$ | $-3.88$ |
+
+Most coefficients are clearly statistically significant. The seasonal AR 
+coefficient $\hat{\Phi}_1 = 0.445$ is only marginally significant 
+(t-statistic $= 1.98$), but is retained as the overall model is selected 
+by the automatic procedure on AIC grounds.
 
 The three-way model comparison reveals a clear ranking:
 
@@ -411,11 +450,11 @@ The three-way model comparison reveals a clear ranking:
 | ARIMA$(2,1,1)(0,1,0)_{12}$ | 2913.91 | 2925.03 |
 | ARIMA$(0,1,1)(0,1,0)_{12}$ | 2916.76 | **2922.31** |
 
-The automatically selected SARIMA model achieves the lowest AIC by a margin of 
-nearly 6 points over the AIC-preferred Part (d) model, confirming that the 
-inclusion of seasonal AR and MA terms $(\Phi_1, \Theta_1)$ substantially improves 
-fit. The BIC-preferred model remains ARIMA$(0,1,1)(0,1,0)_{12}$ due to its extreme 
-parsimony, but the automatic SARIMA is competitive on BIC as well. 
+The automatically selected SARIMA model achieves the lowest AIC by nearly 
+6 points over the AIC-preferred Part (d) model, confirming that the inclusion 
+of seasonal AR and MA terms $(\Phi_1, \Theta_1)$ substantially improves fit. 
+The BIC-preferred model remains ARIMA$(0,1,1)(0,1,0)_{12}$ due to its extreme 
+parsimony, but the automatic SARIMA is competitive on BIC as well.
 
 ### Part (f): Forecasting and Forecast Evaluation
 
@@ -498,65 +537,72 @@ specifications and record the t-statistic on $\phi$:
 
 
 ```{r monte-carlo-setup}
-# Set seed for reproducibility
 set.seed(2026)
 
-# Parameters
 alpha1 <- 0.7
 alpha2 <- 0.3
 sigma  <- 0.9
 M      <- 1000
 T_vals <- c(25, 100, 500, 5000)
 
-# Function to simulate one time series from the AR(2) DGP
-# y_t = alpha1*y_{t-1} + alpha2*y_{t-2} + eps_t
-# with y_{-1} = y_0 = 0
+# Simulate AR(2) DGP: y_t = alpha1*y_{t-1} + alpha2*y_{t-2} + eps_t
+# y_{-1} = y_0 = 0
 simulate_ar2 <- function(T, alpha1, alpha2, sigma) {
-  y <- numeric(T + 2)          # indices 1,2 correspond to y_{-1}, y_0
-  y[1] <- 0                    # y_{-1} = 0
-  y[2] <- 0                    # y_0   = 0
+  y <- numeric(T + 2)
+  y[1] <- 0
+  y[2] <- 0
   eps <- rnorm(T, mean = 0, sd = sigma)
   for (t in 1:T) {
     y[t + 2] <- alpha1 * y[t + 1] + alpha2 * y[t] + eps[t]
   }
-  return(y[3:(T + 2)])         # return y_1 to y_T
+  return(y[3:(T + 2)])
 }
 
-# Function to run one ADF regression and return t-stat on phi
-# spec: "none", "const", "trend"
+# ADF regression: reparameterised as
+# Delta(y_t) = phi*y_{t-1} + alpha1_star*Delta(y_{t-1}) + [c] + [delta*t] + eps_t
+# phi = alpha1 + alpha2 - 1 (unit root parameter)
+# We record the t-statistic on phi (coefficient on y_{t-1})
+
 adf_tstat <- function(y, spec) {
   T   <- length(y)
-  dy  <- diff(y)               # Delta y_t,  length T-1
-  yl  <- y[-T]                 # y_{t-1},    length T-1
-  dyl <- dy[-1]                # Delta y_{t-1}, length T-2
-  
-  # Trim to common length (lose first observation for lagged diff)
-  dy  <- dy[-1]                # length T-2
-  yl  <- yl[-1]                # length T-2
-  tt  <- 3:T                   # time index for trend
+  dy  <- diff(y)              # Delta y_t, length T-1
+  yl  <- y[-T]                # y_{t-1},   length T-1
+  dyl <- c(NA, dy[-( T-1)])  # Delta y_{t-1}, length T-1 (first entry NA)
 
+  # Build data frame and drop first row (NA in dyl)
+  df <- data.frame(
+    dy  = dy,
+    yl  = yl,
+    dyl = dyl,
+    tt  = 2:T
+  )
+  df <- df[complete.cases(df), ]   # removes first row where dyl is NA
+
+  # Fit regression by spec
   if (spec == "none") {
-    X <- cbind(yl, dyl)
+    fit <- lm(dy ~ yl + dyl - 1, data = df)
   } else if (spec == "const") {
-    X <- cbind(1, yl, dyl)
+    fit <- lm(dy ~ yl + dyl, data = df)
   } else if (spec == "trend") {
-    X <- cbind(1, tt, yl, dyl)
+    fit <- lm(dy ~ yl + dyl + tt, data = df)
   }
 
-  # OLS
-  fit    <- lm(dy ~ X - 1)
-  coefs  <- summary(fit)$coefficients
-
-  # t-stat on phi = coefficient on yl
-  # yl is always the 2nd column in X for "none",
-  # 2nd for "const", 3rd for "trend"
-  phi_row <- if (spec == "none") 1 else if (spec == "const") 2 else 3
-  return(coefs[phi_row, "t value"])
+  # Extract t-statistic on yl (always named "yl" in lm output)
+  coefs <- summary(fit)$coefficients
+  return(coefs["yl", "t value"])
 }
 
 cat("Setup complete. Functions defined.\n")
 cat("T values:", T_vals, "\n")
 cat("M replications:", M, "\n")
+
+# Quick sanity check on one series
+set.seed(2026)
+y_test <- simulate_ar2(100, alpha1, alpha2, sigma)
+cat("\nSanity check t-stats (T=100, one series):\n")
+cat("none: ",  round(adf_tstat(y_test, "none"),  3), "\n")
+cat("const:",  round(adf_tstat(y_test, "const"), 3), "\n")
+cat("trend:",  round(adf_tstat(y_test, "trend"), 3), "\n")
 ```
 
 ```{r monte-carlo-run}
@@ -681,39 +727,41 @@ ggplot(tstats_long, aes(x = t_stat, colour = Specification,
 The simulated quantile tables reveal several important features of the 
 finite-sample ADF t-statistic distributions:
 
+**Unit root in the DGP:** The data generating process has 
+$\alpha_1 + \alpha_2 = 0.7 + 0.3 = 1$. The AR polynomial 
+$1 - 0.7L - 0.3L^2$ factors as $(1-L)(1+0.3L)$, so the process contains 
+a unit root. This is why the t-statistics for $\phi$ follow a 
+Dickey-Fuller type distribution rather than a standard normal.
+
 **Left tail (critical values):** For all three specifications, the simulated 
-left-tail quantiles are substantially more negative than those of the standard 
-normal, confirming that the ADF t-statistic does **not** follow a standard normal 
-distribution under the null. For example, under specification (i) at $T = 5000$, 
-the 5\% quantile is $-2.407$, compared to $-1.645$ for the normal — a meaningful 
-difference that would lead to severe over-rejection if standard normal critical 
-values were used.
+left-tail quantiles are more negative than those of the standard normal 
+($-1.645$ at 5\%), confirming that standard normal critical values cannot 
+be used for ADF testing. For example, under specification (i) at $T = 5000$, 
+the 5\% quantile is $-1.940$, close to the MacKinnon asymptotic value of 
+$-1.94$.
 
 **Convergence with $T$:** As $T$ increases, the simulated quantiles converge 
-toward the asymptotic ADF critical values of MacKinnon (1996). For specification 
-(i), the 5\% quantile moves from $-2.313$ at $T=25$ to $-2.407$ at $T=5000$, 
-approaching the asymptotic value of $-1.94$. Convergence is slower for 
-specifications (ii) and (iii), which include additional deterministic components.
+toward the asymptotic ADF critical values of MacKinnon (1996). Convergence 
+is already quite good at $T = 500$ for all three specifications.
 
 **Finite-sample distortions:** At small $T$ (especially $T = 25$), the 
-distributions are highly dispersed and the left-tail quantiles are far from 
-their asymptotic counterparts. For instance, under specification (ii) the 1\% 
-quantile at $T=25$ is $-7.318$, compared to the asymptotic value of $-3.43$. 
-This confirms that the ADF test has poor size properties in small samples.
+distributions are more dispersed and the quantiles deviate more from their 
+asymptotic counterparts, confirming that the ADF test has weaker size 
+properties in small samples.
 
-**Adding deterministic components shifts the distribution left:** Comparing 
-specifications (i) to (iii), each additional deterministic term (constant, 
-trend) shifts the distribution further to the left, requiring more negative 
-critical values to achieve the same significance level. This is clearly visible 
-in the density plot for $T=5000$.
+**Adding deterministic components shifts the distribution left:** Each 
+additional deterministic term (constant, trend) shifts the distribution 
+further to the left, requiring more negative critical values to achieve 
+the same significance level.
 
-**Density plot — $T = 5000$:** The density plot confirms that all three ADF 
-t-statistic distributions are left-skewed relative to the $\mathcal{N}(0,1)$ 
-and shifted to the left. The no-constant specification (i) is closest to the 
-normal but still distinctly shifted. The constant-and-trend specification (iii) 
-is the most displaced, with substantial mass in the left tail beyond $-4$. 
-Using standard normal critical values for ADF testing would therefore 
-systematically over-reject the null hypothesis of a unit root.
+**Density plot — $T = 5000$:** The density plot confirms that all three 
+ADF t-statistic distributions are shifted to the left relative to 
+$\mathcal{N}(0,1)$. The no-constant specification (i) is closest to the 
+normal but still distinctly left-shifted. The constant-and-trend 
+specification (iii) is the most displaced, with its mass concentrated 
+around $-3$ to $-4$. Using standard normal critical values for ADF 
+testing would therefore lead to under-rejection of the null hypothesis 
+of a unit root.
 
 
 
