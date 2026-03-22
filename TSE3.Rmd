@@ -1,0 +1,17 @@
+---
+title: "Time Series Econometrics – Assignment 3"
+subtitle: "Model Selection, Forecasting & Dickey-Fuller Testing"
+author:
+  - "Aadhitya Sankar Prasad"
+  - "Johannes Felix Boppert"
+  - "Keno Klebinger"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+---
