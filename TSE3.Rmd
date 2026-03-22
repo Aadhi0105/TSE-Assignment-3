@@ -2,7 +2,7 @@
 title: "Time Series Econometrics – Assignment 3"
 subtitle: "Model Selection, Forecasting & Dickey-Fuller Testing"
 author:
-  - "Aadhitya Sankar Prasad"
+  - "Aadhitya Tejaswin Prakash Sridevi"
   - "Johannes Felix Boppert"
   - "Keno Klebinger"
 date: "`r Sys.Date()`"
@@ -15,3 +15,32 @@ header-includes:
   - \usepackage{booktabs}
   - \usepackage{float}
 ---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 4
+)
+```
+```{r packages}
+required_pkgs <- c(
+  "readxl", "tseries", "tidyverse", "tsibble",
+  "fable", "fabletools", "feasts", "urca", "forecast"
+)
+
+new_pkgs <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_pkgs)) install.packages(new_pkgs)
+
+library(readxl)
+library(tseries)
+library(tidyverse)
+library(tsibble)
+library(fable)
+library(fabletools)
+library(feasts)
+library(urca)
+library(forecast)
+```
